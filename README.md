@@ -345,7 +345,7 @@ CREATE INDEX idx_track_id ON time_series_events(track_id);
    - Abrir en el navegador: `http://localhost:7474`
    - Credenciales por defecto:
      - **Usuario**: `neo4j`
-     - **Contraseña**: `password` (o la configurada en `docker-compose.yaml`)
+     - **Contraseña**: `password123` (o la configurada en `docker-compose.yaml`)
 
 2. **Ejecutar el Script Cypher**
    - Copiar el contenido del archivo `scripts/init_neo4j.cypher`
