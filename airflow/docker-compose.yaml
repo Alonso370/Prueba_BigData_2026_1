@@ -7,6 +7,12 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1 --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   # 2. Capa Columnar: Apache Cassandra
   cassandra:
@@ -19,6 +25,12 @@ services:
       - HEAP_NEWSIZE=100M
     volumes:
       - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/cassandra/bin/cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
 
   # 3. Capa de Grafos: Neo4j
   neo4j:
@@ -31,16 +43,84 @@ services:
       - NEO4J_AUTH=neo4j/password123
     volumes:
       - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "/var/lib/neo4j/bin/cypher-shell -u neo4j -p password123 'RETURN 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 60s
 
-  # 4. Orquestador: Apache Airflow (Standalone para desarrollo rápido)
+  # 4. Inicialización automática de MongoDB
+  init-mongodb:
+    image: mongo:latest
+    container_name: mongodb_init_utec
+    depends_on:
+      mongodb:
+        condition: service_started
+    volumes:
+      - ../scripts:/scripts:ro
+    command:
+      - sh
+      - -lc
+      - |
+        until mongosh --host mongodb --quiet --eval 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; do
+          echo "Waiting for MongoDB..."
+          sleep 5
+        done
+        mongosh --host mongodb --file /scripts/init_mongo.js
+    restart: "no"
+
+  # 5. Inicialización automática de Cassandra
+  init-cassandra:
+    image: cassandra:latest
+    container_name: cassandra_init_utec
+    depends_on:
+      cassandra:
+        condition: service_started
+    volumes:
+      - ../scripts:/scripts:ro
+    command: |
+      sh -lc '
+        until /opt/cassandra/bin/cqlsh cassandra 9042 -e "DESCRIBE KEYSPACES" >/dev/null 2>&1; do
+          echo "Waiting for Cassandra..."
+          sleep 10
+        done
+        /opt/cassandra/bin/cqlsh cassandra 9042 -f /scripts/init_cassandra.cql
+      '
+    restart: "no"
+
+  # 6. Inicialización automática de Neo4j
+  init-neo4j:
+    image: neo4j:latest
+    container_name: neo4j_init_utec
+    depends_on:
+      neo4j:
+        condition: service_started
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+    volumes:
+      - ../scripts:/scripts:ro
+    command: |
+      sh -lc '
+        until /var/lib/neo4j/bin/cypher-shell -a bolt://neo4j:7687 -u neo4j -p password123 "RETURN 1" >/dev/null 2>&1; do
+          echo "Waiting for Neo4j..."
+          sleep 5
+        done
+        /var/lib/neo4j/bin/cypher-shell -a bolt://neo4j:7687 -u neo4j -p password123 -f /scripts/init_neo4j.cypher
+      '
+    restart: "no"
+
+  # 7. Orquestador: Apache Airflow (Standalone para desarrollo rápido)
   airflow:
-    image: apache/airflow:2.7.1-python3.10
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: airflow-utec:2.7.1-python3.10
     container_name: airflow_utec
     command: standalone
 
     environment:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - _PIP_ADDITIONAL_REQUIREMENTS=pymongo cassandra-driver neo4j pandas
 
     ports:
       - "8080:8080"
@@ -50,9 +130,18 @@ services:
       - ../data:/opt/airflow/data
 
     depends_on:
-      - mongodb
-      - cassandra
-      - neo4j
+      mongodb:
+        condition: service_started
+      cassandra:
+        condition: service_started
+      neo4j:
+        condition: service_started
+      init-mongodb:
+        condition: service_completed_successfully
+      init-cassandra:
+        condition: service_completed_successfully
+      init-neo4j:
+        condition: service_completed_successfully
 
 volumes:
   mongo_data:

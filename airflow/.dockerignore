@@ -1,0 +1,4 @@
+*
+!Dockerfile.airflow
+!requirements-airflow.txt
+!.dockerignore

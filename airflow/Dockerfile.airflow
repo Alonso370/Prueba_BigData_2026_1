@@ -1,0 +1,12 @@
+FROM apache/airflow:2.7.1-python3.10
+
+USER root
+
+COPY --chown=airflow:0 requirements-airflow.txt /tmp/requirements-airflow.txt
+
+USER airflow
+
+RUN pip install --no-cache-dir -r /tmp/requirements-airflow.txt && \
+    rm -f /tmp/requirements-airflow.txt
+
+    
