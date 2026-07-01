@@ -199,6 +199,385 @@ with DAG(
         driver.close()
         print(f"Éxito: {len(rows)} registros vinculados en el grafo de Neo4j.")
 
+
+    def generate_kpis(**kwargs):
+        """Calcula KPIs ejecutivos y actualiza un único documento en MongoDB.
+
+        Documento destino:
+        - Base: spotify_db
+        - Colección: kpis
+        - Documento: _id = spotify_kpis_current
+
+        Nota:
+        En Streamlit los porcentajes se guardan como 0-100.
+        En Power BI las medidas DAX devuelven 0-1 y se formatean como porcentaje.
+        """
+
+        client = MongoClient("mongodb://mongodb:27017/")
+        db = client["spotify_db"]
+        raw_events = db["raw_events"]
+        kpis = db["kpis"]
+
+        def safe_float(value):
+            try:
+                if value is None:
+                    return 0.0
+                return float(value)
+            except Exception:
+                return 0.0
+
+        def safe_pct(numerator, denominator):
+            denominator = safe_float(denominator)
+            if denominator == 0:
+                return 0
+            return round((safe_float(numerator) / denominator) * 100, 2)
+
+        def parse_release_date(value):
+            try:
+                if value is None:
+                    return None
+
+                text_value = str(value).strip()
+
+                if not text_value:
+                    return None
+
+                # Caso: release_date viene como año, por ejemplo "2018"
+                if text_value.isdigit() and len(text_value) == 4:
+                    year = int(text_value)
+                    if 1900 <= year <= 2100:
+                        return datetime(year, 1, 1)
+
+                parsed_date = pd.to_datetime(text_value, errors="coerce")
+
+                if pd.isna(parsed_date):
+                    return None
+
+                return parsed_date.to_pydatetime().replace(tzinfo=None)
+
+            except Exception:
+                return None
+
+        # =========================
+        # Base general
+        # =========================
+        total_canciones_procesadas = raw_events.count_documents({})
+
+        total_streams_result = list(
+            raw_events.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_streams": {"$sum": "$stream_count"},
+                        }
+                    }
+                ],
+                allowDiskUse=True,
+            )
+        )
+
+        total_streams = (
+            safe_float(total_streams_result[0].get("total_streams"))
+            if total_streams_result
+            else 0
+        )
+
+        # =========================
+        # KPI 1:
+        # Concentración de Streams del Top 10 Artistas (%)
+        # =========================
+        top10_artistas = list(
+            raw_events.aggregate(
+                [
+                    {
+                        "$match": {
+                            "artist_name": {
+                                "$nin": [None, "", "Unknown Artist"]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$artist_name",
+                            "streams_artista": {"$sum": "$stream_count"},
+                        }
+                    },
+                    {"$sort": {"streams_artista": -1}},
+                    {"$limit": 10},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "artista": "$_id",
+                            "streams_artista": 1,
+                        }
+                    },
+                ],
+                allowDiskUse=True,
+            )
+        )
+
+        streams_top10_artistas = sum(
+            safe_float(item.get("streams_artista")) for item in top10_artistas
+        )
+
+        concentracion_top10_artistas_pct = safe_pct(
+            streams_top10_artistas,
+            total_streams,
+        )
+
+        # =========================
+        # KPI 2:
+        # Participación del Género Líder (%)
+        # =========================
+        genero_lider_result = list(
+            raw_events.aggregate(
+                [
+                    {
+                        "$match": {
+                            "genre": {"$nin": [None, "", "Unknown"]}
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$genre",
+                            "streams_genero": {"$sum": "$stream_count"},
+                        }
+                    },
+                    {"$sort": {"streams_genero": -1}},
+                    {"$limit": 1},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "genero": "$_id",
+                            "streams_genero": 1,
+                        }
+                    },
+                ],
+                allowDiskUse=True,
+            )
+        )
+
+        genero_lider_nombre = None
+        streams_genero_lider = 0
+
+        if genero_lider_result:
+            genero_lider_nombre = genero_lider_result[0].get("genero")
+            streams_genero_lider = safe_float(
+                genero_lider_result[0].get("streams_genero")
+            )
+
+        participacion_genero_lider_pct = safe_pct(
+            streams_genero_lider,
+            total_streams,
+        )
+
+        # =========================
+        # KPI 3:
+        # Participación del País Líder (%)
+        # =========================
+        pais_lider_result = list(
+            raw_events.aggregate(
+                [
+                    {
+                        "$match": {
+                            "country": {"$nin": [None, "", "Global"]}
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$country",
+                            "streams_pais": {"$sum": "$stream_count"},
+                        }
+                    },
+                    {"$sort": {"streams_pais": -1}},
+                    {"$limit": 1},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "pais": "$_id",
+                            "streams_pais": 1,
+                        }
+                    },
+                ],
+                allowDiskUse=True,
+            )
+        )
+
+        pais_lider_nombre = None
+        streams_pais_lider = 0
+
+        if pais_lider_result:
+            pais_lider_nombre = pais_lider_result[0].get("pais")
+            streams_pais_lider = safe_float(
+                pais_lider_result[0].get("streams_pais")
+            )
+
+        participacion_pais_lider_pct = safe_pct(
+            streams_pais_lider,
+            total_streams,
+        )
+
+        # =========================
+        # KPIs a nivel canción
+        # Agrupamos por track_id para evitar contar varias veces una misma canción.
+        # =========================
+        canciones = list(
+            raw_events.aggregate(
+                [
+                    {
+                        "$match": {
+                            "track_id": {"$nin": [None, ""]}
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$track_id",
+                            "track_name": {"$first": "$track_name"},
+                            "artist_name": {"$first": "$artist_name"},
+                            "stream_count": {"$sum": "$stream_count"},
+                            "popularity": {"$max": "$popularity"},
+                            "release_date": {"$first": "$release_date"},
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "track_id": "$_id",
+                            "track_name": 1,
+                            "artist_name": 1,
+                            "stream_count": 1,
+                            "popularity": 1,
+                            "release_date": 1,
+                        }
+                    },
+                ],
+                allowDiskUse=True,
+            )
+        )
+
+        total_canciones_unicas = len(canciones)
+
+        # =========================
+        # KPI 4:
+        # Porcentaje de Canciones Exitosas
+        # Popularity >= 80
+        # =========================
+        canciones_exitosas = sum(
+            1 for song in canciones
+            if safe_float(song.get("popularity")) >= 80
+        )
+
+        porcentaje_canciones_exitosas = safe_pct(
+            canciones_exitosas,
+            total_canciones_unicas,
+        )
+
+        # =========================
+        # KPI 5:
+        # Porcentaje de Canciones Populares
+        # stream_count > 100,000,000
+        # =========================
+        canciones_populares = sum(
+            1 for song in canciones
+            if safe_float(song.get("stream_count")) > 100_000_000
+        )
+
+        porcentaje_canciones_populares = safe_pct(
+            canciones_populares,
+            total_canciones_unicas,
+        )
+
+        # =========================
+        # KPI 6:
+        # Edad Promedio del Top 100 más Escuchado
+        # =========================
+        fecha_referencia = datetime.now()
+
+        top100_canciones = sorted(
+            canciones,
+            key=lambda song: safe_float(song.get("stream_count")),
+            reverse=True,
+        )[:100]
+
+        edades_top100 = []
+
+        for song in top100_canciones:
+            release_date = parse_release_date(song.get("release_date"))
+
+            if release_date is None:
+                continue
+
+            edad_anios = (fecha_referencia - release_date).days / 365.25
+
+            if edad_anios >= 0:
+                edades_top100.append(edad_anios)
+
+        edad_promedio_top100 = (
+            round(sum(edades_top100) / len(edades_top100), 2)
+            if edades_top100
+            else 0
+        )
+
+        # =========================
+        # Documento final para Streamlit
+        # =========================
+        kpi_document = {
+            "fecha_actualizacion": datetime.now(),
+
+            "total_canciones_procesadas": total_canciones_procesadas,
+            "total_canciones_unicas": total_canciones_unicas,
+            "total_streams": total_streams,
+
+            "kpi_01_concentracion_streams_top10_artistas_pct": concentracion_top10_artistas_pct,
+            "kpi_02_participacion_genero_lider_pct": participacion_genero_lider_pct,
+            "kpi_03_participacion_pais_lider_pct": participacion_pais_lider_pct,
+            "kpi_04_porcentaje_canciones_exitosas": porcentaje_canciones_exitosas,
+            "kpi_05_porcentaje_canciones_populares": porcentaje_canciones_populares,
+            "kpi_06_edad_promedio_top100_mas_escuchado": edad_promedio_top100,
+
+            "streams_top10_artistas": streams_top10_artistas,
+            "top10_artistas": top10_artistas,
+
+            "genero_lider_nombre": genero_lider_nombre,
+            "streams_genero_lider": streams_genero_lider,
+
+            "pais_lider_nombre": pais_lider_nombre,
+            "streams_pais_lider": streams_pais_lider,
+
+            "canciones_exitosas": canciones_exitosas,
+            "canciones_populares": canciones_populares,
+
+            "fecha_referencia_edad": fecha_referencia.isoformat(),
+        }
+
+        kpis.update_one(
+            {"_id": "spotify_kpis_current"},
+            {
+                "$set": kpi_document,
+                "$unset": {
+                    "kpi_01_reproduccion_promedio_canciones": "",
+                    "kpi_02_popularidad_promedio_generos": "",
+                    "kpi_03_popularidad_promedio_paises": "",
+                    "kpi_04_numero_artistas": "",
+                    "kpi_05_total_reproducciones": "",
+                    "kpi_06_promedio_canciones_por_artista": "",
+                    "numero_generos_analizados": "",
+                    "numero_paises_analizados": "",
+                    "kpi_02_popularidad_segun_genero": "",
+                    "kpi_03_popularidad_segun_pais": "",
+                    "kpi_05_genero_con_mas_reproducciones": "",
+                    "kpi_06_artista_con_mas_reproducciones": "",
+                },
+            },
+            upsert=True,
+        )
+
+        client.close()
+
+        print("Éxito: KPIs ejecutivos actualizados correctamente en MongoDB.")
+        print(kpi_document)
+
     # TAREAS DE AIRFLOW
     task_extract = PythonOperator(
         task_id='extract_and_validate',
@@ -230,5 +609,12 @@ with DAG(
         provide_context=True
     )
 
-    # FLUJO DEL PIPELINE (Dejamos Neo4j para el siguiente paso)
-    task_extract >> [task_mongo, task_cassandra, task_neo4j] >> task_cleanup
+    task_kpis = PythonOperator(
+        task_id='generate_kpis',
+        python_callable=generate_kpis,
+        provide_context=True
+    )
+
+    # FLUJO DEL PIPELINE
+    # Primero se cargan las 3 bases de datos, luego se actualizan KPIs y finalmente se limpia la cola.
+    task_extract >> [task_mongo, task_cassandra, task_neo4j] >> task_kpis >> task_cleanup
